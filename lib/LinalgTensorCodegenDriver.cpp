@@ -6,6 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Dialects/LinalgExt/LinalgExtDialect.h"
+#include "Dialects/LinalgExt/LinalgExtBufferization.h"
 #include "Transforms/PassDetail.h"
 #include "Transforms/Passes.h"
 #include "Transforms/Transforms.h"
@@ -381,6 +383,7 @@ void LinalgBufferizationDriverPass::getDependentDialects(
   registry.insert<AffineDialect>();
   registry.insert<bufferization::BufferizationDialect>();
   registry.insert<linalg::LinalgDialect>();
+  registry.insert<mlir::linalg_ext::LinalgExtDialect>();
   registry.insert<memref::MemRefDialect>();
   registry.insert<bufferization::BufferizationDialect>();
   registry.insert<scf::SCFDialect>();
@@ -403,6 +406,8 @@ void LinalgBufferizationDriverPass::getDependentDialects(
   linalg::comprehensive_bufferize::tensor_ext::
       registerBufferizableOpInterfaceExternalModels(registry);
   linalg::comprehensive_bufferize::vector_ext::
+      registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::linalg_ext::
       registerBufferizableOpInterfaceExternalModels(registry);
 }
 

@@ -1,3 +1,15 @@
+set(LLVM_OPTIONAL_SOURCES
+  InParallelToAsync.cpp
+  InParallelToSequentialFor.cpp
+  LinalgExtBufferization.cpp
+  TilingExternalModels.cpp
+  TileToInParallel.cpp
+  TileToSequentialFor.cpp
+  Tiling.cpp
+  TilingToTileOp.cpp
+  Utils.cpp
+)
+
 add_mlir_library(MLIRLinalgExtTransforms
   InParallelToAsync.cpp
   InParallelToSequentialFor.cpp
@@ -27,4 +39,12 @@ add_mlir_library(MLIRLinalgExtTransforms
   MLIRPass
   MLIRSCF
   MLIRTransforms
+)
+
+add_mlir_library(MLIRLinalgExtOpInterfaceImpl
+  LinalgExtBufferization.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRBufferizableOpInterface
+  MLIRLinalgExt
 )

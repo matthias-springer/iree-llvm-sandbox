@@ -9,6 +9,7 @@ add_mlir_library(IREELinalgTensorSandbox
   MLIRAsync
   MLIRGPUOps
   MLIRLinalg
+  MLIRLinalgExtOpInterfaceImpl
   MLIRLinalgTransforms
   MLIRAffineToStandard
   MLIRMemRefTransforms
