@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import signal
 import sys
+import threading
 import typing as tp
 
 from ..core.harness import *
@@ -53,8 +54,7 @@ class NGMPEvaluation(NGEvaluation):
 def compile_and_run_checked_mp(problem: ProblemInstance, \
                                scheduler: NGSchedulerInterface,
                                proposal,
-                               n_iters: int,
-                               ipc_dict: dict):
+                               n_iters: int):
   """Entry point to compile and run while catching and reporting exceptions.
 
   This can run in interruptible multiprocess mode.
@@ -87,13 +87,13 @@ def compile_and_run_checked_mp(problem: ProblemInstance, \
     # TODO: redirect to a file if we want this information.
     f.flush()
 
-    ipc_dict['result'] = IPCState(success=True, throughputs=throughputs)
+    return proposal, throughputs
   except Exception as e:
     import traceback
     traceback.print_exc()
     # TODO: save to replay errors.
     print(e)
-    ipc_dict['result'] = IPCState(success=False, throughputs=None)
+    return proposal, None
 
 
 def cpu_count():
@@ -205,152 +205,74 @@ def finalize_parallel_search(scheduler: NGSchedulerInterface, \
 
 
 ################################################################################
-### Multiprocess join support.
-################################################################################
-
-
-def join_at_least_one_process(ng_mp_evaluations: tp.Sequence[NGMPEvaluation]):
-  """ Join at least one process in `ng_mp_evaluations`.
-
-  Note: `ng_mp_evaluations` may contain `None` entries (i.e. empty slots).
-  These are just skipped.
-
-  The parent process performs busy-waiting until it has synchronized at least 
-  one process (either because it terminated or because it timed out).
-  
-  Additionally, update `ng_mp_evaluations` for further processing across the 
-  single / multi process boundary:
-    1. on a timeout or an exception, the ipc_state entry in the corresponding
-      ng_mp_evaluation has its success status set to False.
-    2. on a successful finish, the ipc_state entry in the corresponding
-      ng_mp_evaluations succeeded ad contains the throughputs. This is used to
-      communicate back the compiled state of the problem across the single / 
-      multiprocess boundary.
-  """
-
-  import time
-  sleep_time = 0.1
-
-  # Iterate on evaluations until we find one that has been marked 'joined'.
-  done = False
-  while not done:
-    time.sleep(sleep_time)
-    for idx in range(len(ng_mp_evaluations)):
-      # Invariant: Always decrease the timer for this process.
-      evaluation = ng_mp_evaluations[idx]
-      if evaluation is None:
-        continue
-      evaluation.time_left = evaluation.time_left - sleep_time
-
-      # This process was already joined, skip.
-      evaluation = ng_mp_evaluations[idx]
-      assert evaluation.joined_with_root == False, "Evaluation already joined"
-
-      process = evaluation.process
-      # This process finished by itself, join with it and mark it joined.
-      if not process.is_alive():
-        process.join()
-        evaluation.joined_with_root = True
-        done = True
-        continue
-
-      # This process timed out, terminate, join and mark it joined.
-      if evaluation.time_left <= 0:
-        f = io.StringIO()
-        with redirect_stdout(f):
-          print(f'timeout: {evaluation.proposal} did not complete')
-          # TODO: redirect to a file if we want this information.
-          f.flush()
-        evaluation.process.terminate()
-        evaluation.process.join()
-        # Override to return a failed IPCState and signify infinite relative_error.
-        evaluation.ipc_state = lambda: IPCState(success=False, throughputs=None)
-        evaluation.joined_with_root = True
-        done = True
-
-      # This process needs to continue.
-
-    if done:
-      break
-
-  return [
-      idx for idx, e in enumerate(ng_mp_evaluations)
-      if e is not None and e.joined_with_root == True
-  ]
-
-
-################################################################################
 ### Multiprocess optimization loops.
 ################################################################################
+
+def process_proposal(scheduler: NGSchedulerInterface, proposal, problem_definition: ProblemDefinition, n_iters):
+  print("process_proposal")
+  # Create problem instance, which holds the compiled module and the
+  # ExecutionEngine.
+  problem_types = [np.float32] * 3
+  problem_instance = ProblemInstance(problem_definition, problem_types)
+  return proposal, compile_and_run_checked_mp(problem_instance, scheduler, proposal, n_iters)
 
 global interrupted
 
 def async_optim_loop(problem_definition: ProblemDefinition, \
                      scheduler: NGSchedulerInterface,
                      parsed_args):
-  """Asynchronous NG scheduling problem with multi-process evaluation of proposals.
-  """
-  mp_manager = mp.Manager()
+  print("running with #processes: " + str(parsed_args.num_compilation_processes))
+  pool = mp.Pool(parsed_args.num_compilation_processes)
+  enqueued = 0
+  scheduler_lock = threading.Lock()
 
-  # TODO: extract info from final recommendation instead of an auxiliary `throughputs` list
-  search_number = 0
-  throughputs = []
-  ng_mp_evaluations = [None] * parsed_args.num_compilation_processes
+  def process_evaluation_result(result):
+    nonlocal enqueued, pool, scheduler_lock
+    print("process_evaluation_result")
+    with scheduler_lock:
+      if enqueued < parsed_args.search_budget:
+        enqueue_proposal()
 
-  interrupted = []
+    proposal = result[0]
+    throughputs = result[1]
+    if not throughputs:
+      scheduler.optimizer.tell(proposal, 1)
+      return
 
-  def signal_handler(sig, frame):
-    interrupted.append(True)
+    process_throughputs = throughputs[parsed_args.metric_to_measure]
+    # Calculate the relative distance to peak: invert the throughput @90%
+    # (i.e. 6th computed quantile).
+    # Lower is better.
+    # This matches the optimization process which is a minimization.
+    throughput = compute_quantiles(process_throughputs)[6]
+    relative_error = \
+      (parsed_args.machine_peak - throughput) / parsed_args.machine_peak
+    scheduler.optimizer.tell(proposal, relative_error)
 
-  signal.signal(signal.SIGINT, signal_handler)
+    print("Throughput of proposal: " + str(throughput))
 
-  best = 0
-  while len(interrupted) == 0 and search_number < parsed_args.search_budget:
-    if search_number % 10 == 1:
-      sys.stdout.write(f'*******\t' +
-                       f'{parsed_args.search_strategy} optimization iter ' +
-                       f'{search_number} / {parsed_args.search_budget}\t' +
-                       f'best so far: {best} GUnits/s\r')
-      sys.stdout.flush()
+  def enqueue_proposal(): 
+    nonlocal enqueued, pool, scheduler_lock
+    #def process_proposal():
+    #  print("ASD!")
+    print("enqueue_proposal")
+    proposal = scheduler.optimizer.ask()
+    #(scheduler, proposal, problem_definition, parsed_args.n_iters),
+    #pool.apply_async(process_proposal, callback=process_evaluation_result)
+    pool.apply(process_proposal, (scheduler, proposal, problem_definition, parsed_args.n_iters))
+    enqueued = enqueued + 1
+    print("enqueued")
 
-    # Find the first empty slot in ng_mp_evaluations.
-    if not None in ng_mp_evaluations:
-      # Join at least one process if nothing is available.
-      processes_joined = join_at_least_one_process(ng_mp_evaluations)
-      assert len(processes_joined) > 0, "no processes were joined"
-      for process_idx in processes_joined:
-        throughput = tell_joined_process(ng_mp_evaluations, process_idx,
-                                         scheduler, throughputs, parsed_args)
-        throughput = int(throughput)
-        best = throughput if throughput > best else best
-        ng_mp_evaluations[process_idx] = None
+  with scheduler_lock:
+    for _ in range(2 * parsed_args.num_compilation_processes):
+      enqueue_proposal()
+  
+  while 1:
+    with scheduler_lock:
+      if enqueued == parsed_args.search_budget:
+        print("waiting for stop")
+        pool.close()
+        pool.join()
+        break
+    time.sleep(1)
 
-    # We are sure there is at least one empty slot.
-    compilation_number = ng_mp_evaluations.index(None)
-
-    # Fill that empty slot.
-    ask_and_fork_process(mp_manager, problem_definition, [np.float32] * 3,
-                         ng_mp_evaluations, compilation_number, scheduler,
-                         parsed_args)
-
-    search_number = search_number + 1
-
-  if interrupted:
-    for e in ng_mp_evaluations:
-      if e is not None:
-        e.time_left = 0
-    print('\n')
-
-  # Tell tail what's what.
-  while any(e is not None for e in ng_mp_evaluations):
-    # Join at least one process if nothing is available.
-    processes_joined = join_at_least_one_process(ng_mp_evaluations)
-    assert len(processes_joined) > 0, "no processes were joined"
-    for process_idx in processes_joined:
-      throughput = tell_joined_process(ng_mp_evaluations, process_idx,
-                                       scheduler, throughputs, parsed_args)
-      throughput = int(throughput)
-      best = throughput if throughput > best else best
-      ng_mp_evaluations[process_idx] = None
-
-  finalize_parallel_search(scheduler, throughputs, parsed_args)
